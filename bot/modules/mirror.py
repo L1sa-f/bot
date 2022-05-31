@@ -1,5 +1,5 @@
 from base64 import b64encode
-from requests import utils as rutils
+from requests import utils as rutils, get as rget
 from re import match as re_match, search as re_search, split as re_split
 from time import sleep, time
 from os import path as ospath, remove as osremove, listdir, walk
@@ -10,6 +10,7 @@ from pathlib import PurePath
 from html import escape
 from telegram.ext import CommandHandler
 from telegram import InlineKeyboardMarkup
+from asyncio import run
 
 from bot import Interval, INDEX_URL, BUTTON_FOUR_NAME, BUTTON_FOUR_URL, BUTTON_FIVE_NAME, BUTTON_FIVE_URL, \
                 BUTTON_SIX_NAME, BUTTON_SIX_URL, VIEW_LINK, aria2, QB_SEED, dispatcher, DOWNLOAD_DIR, \
@@ -50,6 +51,7 @@ class MirrorListener:
         self.pswd = pswd
         self.tag = tag
         self.isPrivate = self.message.chat.type in ['private', 'group']
+        self.loop = None
 
     def clean(self):
         try:
@@ -162,7 +164,11 @@ class MirrorListener:
             with download_dict_lock:
                 download_dict[self.uid] = tg_upload_status
             update_all_messages()
-            tg.upload()
+            if self.loop is not None:
+                self.loop.run_until_complete(tg.upload())
+                self.loop.close()
+            else:
+                run(tg.upload())
         else:
             size = get_path_size(up_path)
             LOGGER.info(f"Upload Name: {up_name}")
@@ -205,7 +211,7 @@ class MirrorListener:
                 sendMessage(msg, self.bot, self.message)
             else:
                 fmsg = ''
-                for index, (name, link) in enumerate(files.items(), start=1):
+                for index, (link, name) in enumerate(files.items(), start=1):
                     fmsg += f"{index}. <a href='{link}'>{name}</a>\n"
                     if len(fmsg.encode() + msg.encode()) > 4000:
                         sendMessage(msg + fmsg, self.bot, self.message)
@@ -332,27 +338,21 @@ def _mirror(bot, message, isZip=False, extract=False, isQbit=False, isLeech=Fals
             else:
                 tag = reply_to.from_user.mention_html(reply_to.from_user.first_name)
 
-        if (
-            not is_url(link)
-            and not is_magnet(link)
-            or len(link) == 0
-        ):
-
+        if not is_url(link) and not is_magnet(link) or len(link) == 0:
             if file is None:
                 reply_text = reply_to.text
                 if is_url(reply_text) or is_magnet(reply_text):
                     link = reply_text.strip()
             elif file.mime_type != "application/x-bittorrent" and not isQbit:
                 listener = MirrorListener(bot, message, isZip, extract, isQbit, isLeech, pswd, tag)
-                tg_downloader = TelegramDownloadHelper(listener)
-                tg_downloader.add_download(message, f'{DOWNLOAD_DIR}{listener.uid}/', name)
+                Thread(target=TelegramDownloadHelper(listener).async_starter, args=(message, f'{DOWNLOAD_DIR}{listener.uid}/', name)).start()
                 if multi > 1:
-                    sleep(3)
+                    sleep(4)
                     nextmsg = type('nextmsg', (object, ), {'chat_id': message.chat_id, 'message_id': message.reply_to_message.message_id + 1})
                     nextmsg = sendMessage(message_args[0], bot, nextmsg)
                     nextmsg.from_user.id = message.from_user.id
                     multi -= 1
-                    sleep(3)
+                    sleep(4)
                     Thread(target=_mirror, args=(bot, nextmsg, isZip, extract, isQbit, isLeech, pswd, multi)).start()
                 return
             else:
@@ -385,6 +385,32 @@ def _mirror(bot, message, isZip=False, extract=False, isQbit=False, isLeech=Fals
                 LOGGER.info(str(e))
                 if str(e).startswith('ERROR:'):
                     return sendMessage(str(e), bot, message)
+    elif isQbit and not is_magnet(link) and not ospath.exists(link):
+        if link.endswith('.torrent') or "https://api.telegram.org/file/" in link:
+            content_type = None
+        else:
+            content_type = get_content_type(link)
+        if content_type is None or re_match(r'application/x-bittorrent|application/octet-stream', content_type):
+            try:
+                resp = rget(link, timeout=10, headers = {'user-agent': 'Wget/1.12'})
+                if resp.status_code == 200:
+                    file_name = str(time()).replace(".", "") + ".torrent"
+                    with open(file_name, "wb") as t:
+                        t.write(resp.content)
+                    link = str(file_name)
+                else:
+                    return sendMessage(f"{tag} ERROR: link got HTTP response: {resp.status_code}", bot, message)
+            except Exception as e:
+                error = str(e).replace('<', ' ').replace('>', ' ')
+                if error.startswith('No connection adapters were found for'):
+                    link = error.split("'")[1]
+                else:
+                    LOGGER.error(str(e))
+                    return sendMessage(tag + " " + error, bot, message)
+        else:
+            msg = "Qb commands for torrents only. if you are trying to dowload torrent then report."
+            return sendMessage(msg, bot, message)
+
 
     listener = MirrorListener(bot, message, isZip, extract, isQbit, isLeech, pswd, tag)
 
@@ -398,9 +424,8 @@ def _mirror(bot, message, isZip=False, extract=False, isQbit=False, isLeech=Fals
             Thread(target=add_gd_download, args=(link, listener, is_gdtot)).start()
     elif is_mega_link(link):
         Thread(target=add_mega_download, args=(link, f'{DOWNLOAD_DIR}{listener.uid}/', listener)).start()
-    elif isQbit:
-        qb_dl = QbDownloader(listener)
-        Thread(target=qb_dl.add_qb_torrent, args=(link, f'{DOWNLOAD_DIR}{listener.uid}', qbitsel)).start()
+    elif isQbit and (is_magnet(link) or ospath.exists(link)):
+        Thread(target=QbDownloader(listener).add_qb_torrent, args=(link, f'{DOWNLOAD_DIR}{listener.uid}', qbitsel)).start()
     else:
         if len(mesg) > 1:
             try:
@@ -418,7 +443,7 @@ def _mirror(bot, message, isZip=False, extract=False, isQbit=False, isLeech=Fals
         Thread(target=add_aria2c_download, args=(link, f'{DOWNLOAD_DIR}{listener.uid}', listener, name, auth)).start()
 
     if multi > 1:
-        sleep(3)
+        sleep(4)
         nextmsg = type('nextmsg', (object, ), {'chat_id': message.chat_id, 'message_id': message.reply_to_message.message_id + 1})
         msg = message_args[0]
         if len(mesg) > 2:
@@ -426,7 +451,7 @@ def _mirror(bot, message, isZip=False, extract=False, isQbit=False, isLeech=Fals
         nextmsg = sendMessage(msg, bot, nextmsg)
         nextmsg.from_user.id = message.from_user.id
         multi -= 1
-        sleep(3)
+        sleep(4)
         Thread(target=_mirror, args=(bot, nextmsg, isZip, extract, isQbit, isLeech, pswd, multi)).start()
 
 
